@@ -1,4 +1,4 @@
-name: Crypto Pump Scanner
+name: Crypto Pump Scanner v1
 
 on:
   workflow_dispatch:
