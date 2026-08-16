@@ -1,115 +1,125 @@
-def scan():
-    profiles = get_latest_profiles()
+import requests
+import time
+from datetime import datetime, timezone
 
-    print(f"[DEBUG] Profiles received: {len(profiles)}")
 
-    if not profiles:
-        print("[DEBUG] No profiles received from DexScreener.")
-        return []
+DEXSCREENER = "https://api.dexscreener.com"
 
-    results = []
+SESSION = requests.Session()
+SESSION.headers.update({
+    "User-Agent": "Crypto-Pump-Scanner/1.0"
+})
 
-    profiles_checked = 0
-    pairs_found = 0
-    ignored_count = 0
-    discovery_count = 0
-    early_radar_count = 0
 
-    # محدودیت اولیه برای جلوگیری از فشار روی API
-    for profile in profiles[:30]:
+def get_json(url, timeout=20):
+    try:
+        response = SESSION.get(url, timeout=timeout)
 
-        profiles_checked += 1
+        if response.status_code == 429:
+            print("[ERROR] DexScreener rate limit reached.")
+            return None
 
-        chain_id = profile.get("chainId")
-        token_address = profile.get("tokenAddress")
+        response.raise_for_status()
+        return response.json()
 
-        if not chain_id or not token_address:
-            print("[DEBUG] Profile missing chain/token address.")
-            continue
+    except requests.RequestException as exc:
+        print(f"[ERROR] API request failed: {exc}")
+        return None
 
-        pairs = get_token_pairs(chain_id, token_address)
 
-        if not pairs:
-            continue
+def get_latest_profiles():
+    url = f"{DEXSCREENER}/token-profiles/latest/v1"
 
-        pairs_found += len(pairs)
+    data = get_json(url)
 
-        # انتخاب Pair با بیشترین Liquidity
-        pairs.sort(
-            key=lambda p: safe_number(
-                (p.get("liquidity") or {}).get("usd")
-            ),
-            reverse=True
-        )
+    if isinstance(data, list):
+        return data
 
-        pair = pairs[0]
+    return []
 
-        analysis = score_pair(pair)
 
-        if analysis["status"] == "IGNORE":
-            ignored_count += 1
-            continue
-
-        if analysis["status"] == "DISCOVERY":
-            discovery_count += 1
-
-        elif analysis["status"] == "EARLY RADAR":
-            early_radar_count += 1
-
-        base = pair.get("baseToken") or {}
-
-        results.append({
-            "symbol": base.get("symbol", "UNKNOWN"),
-            "name": base.get("name", "Unknown"),
-            "chain": chain_id,
-            "pair_address": pair.get("pairAddress"),
-            "url": pair.get("url"),
-            **analysis
-        })
-
-        time.sleep(0.15)
-
-    results.sort(
-        key=lambda item: item["score"],
-        reverse=True
+def get_token_pairs(chain_id, token_address):
+    url = (
+        f"{DEXSCREENER}/token-pairs/v1/"
+        f"{chain_id}/{token_address}"
     )
 
-    print("")
-    print("========== SCANNER DEBUG ==========")
-    print(f"Profiles received : {len(profiles)}")
-    print(f"Profiles checked  : {profiles_checked}")
-    print(f"Pairs found       : {pairs_found}")
-    print(f"Discovery         : {discovery_count}")
-    print(f"Early Radar       : {early_radar_count}")
-    print(f"Ignored           : {ignored_count}")
-    print(f"Final candidates  : {len(results)}")
-    print("===================================")
-    print("")
+    data = get_json(url)
 
-    # نمایش 10 مورد برتر برای بررسی
-    for item in results[:10]:
-        print(
-            f"[DEBUG] "
-            f"{item['status']} | "
-            f"{item['symbol']} | "
-            f"Score={item['score']} | "
-            f"Liquidity=${item['liquidity']:,.0f} | "
-            f"Vol1H=${item['volume_1h']:,.0f} | "
-            f"Buy/Sell5M={item['buy_sell_5m']:.2f}"
+    if isinstance(data, list):
+        return data
+
+    return []
+
+
+def safe_number(value, default=0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def calculate_age_hours(pair_created_at):
+    if not pair_created_at:
+        return None
+
+    try:
+        created = datetime.fromtimestamp(
+            pair_created_at / 1000,
+            tz=timezone.utc
         )
 
-    return results
-if __name__ == "__main__":
-    results = scan()
+        now = datetime.now(timezone.utc)
 
-    print(f"Candidates found: {len(results)}")
+        return max(
+            0,
+            (now - created).total_seconds() / 3600
+        )
 
-    for item in results[:20]:
-        print(
-            f"{item['status']} | "
-            f"{item['symbol']} | "
-            f"Score {item['score']} | "
-            f"Liquidity ${item['liquidity']:,.0f} | "
-            f"1H Vol ${item['volume_1h']:,.0f} | "
-            f"Buy/Sell 5M {item['buy_sell_5m']:.2f}"
-  )
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def score_pair(pair):
+
+    score = 0
+    reasons = []
+
+    liquidity = safe_number(
+        (pair.get("liquidity") or {}).get("usd")
+    )
+
+    volume = pair.get("volume") or {}
+
+    volume_5m = safe_number(volume.get("m5"))
+    volume_1h = safe_number(volume.get("h1"))
+    volume_6h = safe_number(volume.get("h6"))
+    volume_24h = safe_number(volume.get("h24"))
+
+    price_change = pair.get("priceChange") or {}
+
+    change_5m = safe_number(price_change.get("m5"))
+    change_1h = safe_number(price_change.get("h1"))
+    change_6h = safe_number(price_change.get("h6"))
+
+    txns = pair.get("txns") or {}
+
+    tx_5m = txns.get("m5") or {}
+    tx_1h = txns.get("h1") or {}
+
+    buys_5m = safe_number(tx_5m.get("buys"))
+    sells_5m = safe_number(tx_5m.get("sells"))
+
+    buys_1h = safe_number(tx_1h.get("buys"))
+    sells_1h = safe_number(tx_1h.get("sells"))
+
+    age_hours = calculate_age_hours(
+        pair.get("pairCreatedAt")
+    )
+
+    # ==============================
+    # LIQUIDITY
+    # ==============================
+
+    if liquidity >= 100_000:
+        score +=
