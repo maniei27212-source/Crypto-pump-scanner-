@@ -1,18 +1,62 @@
 import requests
 
 
-BASE_URL = "https://api.geckoterminal.com/api/v2"
+DEX_URL = (
+    "https://api.dexscreener.com/latest/dex/pairs/"
+    "solana/edx18gjcdijqslaja2pp5c2vma3btrrx4utxkejufrtq"
+)
+
+GECKO_BASE = "https://api.geckoterminal.com/api/v2"
 
 
-def get_ohlcv(network, pool_address, timeframe, aggregate):
+def get_dex_pair():
+    response = requests.get(
+        DEX_URL,
+        timeout=20,
+    )
+
+    response.raise_for_status()
+
+    data = response.json()
+
+    pairs = data.get("pairs") or []
+
+    if not pairs:
+        raise RuntimeError(
+            "DexScreener returned no pair."
+        )
+
+    return pairs[0]
+
+
+def find_gecko_pools(token_address):
     url = (
-        f"{BASE_URL}/networks/{network}"
-        f"/pools/{pool_address}"
-        f"/ohlcv/{timeframe}"
+        f"{GECKO_BASE}/networks/solana/"
+        f"tokens/{token_address}/pools"
+    )
+
+    response = requests.get(
+        url,
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "Crypto-Pump-Scanner/1.0",
+        },
+        timeout=20,
+    )
+
+    response.raise_for_status()
+
+    return response.json()
+
+
+def get_ohlcv(pool_address):
+    url = (
+        f"{GECKO_BASE}/networks/solana/"
+        f"pools/{pool_address}/ohlcv/minute"
     )
 
     params = {
-        "aggregate": aggregate,
+        "aggregate": 15,
         "limit": 100,
         "currency": "usd",
     }
@@ -29,44 +73,102 @@ def get_ohlcv(network, pool_address, timeframe, aggregate):
 
     response.raise_for_status()
 
-    data = response.json()
-
-    return data
+    return response.json()
 
 
 def main():
 
-    # HBULL pool address
-    network = "solana"
+    print("1. Getting HBULL pair from DexScreener...")
 
-    pool_address = (
-        "edx18gjcdijqslaja2pp5c2vma3btrrx4utxkejufrtq"
-    )
+    pair = get_dex_pair()
 
-    print("Testing GeckoTerminal OHLCV...")
+    base_token = pair.get("baseToken") or {}
+
+    token_address = base_token.get("address")
+    symbol = base_token.get("symbol")
+
+    print(f"Token: {symbol}")
+    print(f"Token address: {token_address}")
     print()
 
-    # 15-minute candles
-    data = get_ohlcv(
-        network,
-        pool_address,
-        "minute",
-        15,
+    if not token_address:
+        raise RuntimeError(
+            "Could not find token address."
+        )
+
+    print("2. Finding GeckoTerminal pools...")
+
+    pools_data = find_gecko_pools(
+        token_address
+    )
+
+    pools = (
+        pools_data
+        .get("data")
+        or []
+    )
+
+    print(
+        f"Pools found: {len(pools)}"
+    )
+
+    if not pools:
+        print(
+            "❌ No GeckoTerminal pools found."
+        )
+        return
+
+    # انتخاب اولین pool فعلاً فقط برای تست
+    pool = pools[0]
+
+    pool_id = pool.get("id")
+
+    print(
+        f"Selected pool: {pool_id}"
+    )
+
+    if not pool_id:
+        raise RuntimeError(
+            "Pool ID not found."
+        )
+
+    # GeckoTerminal pool ID معمولاً به شکل:
+    # solana_POOL_ADDRESS
+    if "_" in pool_id:
+        pool_address = pool_id.split(
+            "_", 1
+        )[1]
+    else:
+        pool_address = pool_id
+
+    print(
+        f"Pool address: {pool_address}"
+    )
+    print()
+
+    print(
+        "3. Getting 15M OHLCV..."
+    )
+
+    ohlcv_data = get_ohlcv(
+        pool_address
     )
 
     candles = (
-        data.get("data", {})
+        ohlcv_data
+        .get("data", {})
         .get("attributes", {})
         .get("ohlcv_list", [])
     )
 
     print(
-        f"15M candles received: {len(candles)}"
+        f"15M candles received: "
+        f"{len(candles)}"
     )
 
     if not candles:
         print(
-            "❌ No OHLCV data returned."
+            "❌ No OHLCV data."
         )
         return
 
@@ -74,32 +176,24 @@ def main():
     print("Latest candles:")
     print("----------------")
 
-    # API may return newest first.
     for candle in candles[:5]:
 
-        timestamp = candle[0]
-        open_price = candle[1]
-        high = candle[2]
-        low = candle[3]
-        close = candle[4]
-        volume = candle[5]
-
         print(
-            f"Time: {timestamp}"
+            f"Time: {candle[0]}"
         )
 
         print(
-            f"O: {open_price} | "
-            f"H: {high} | "
-            f"L: {low} | "
-            f"C: {close} | "
-            f"V: {volume}"
+            f"O: {candle[1]} | "
+            f"H: {candle[2]} | "
+            f"L: {candle[3]} | "
+            f"C: {candle[4]} | "
+            f"V: {candle[5]}"
         )
 
         print()
 
     print(
-        "✅ OHLCV test successful."
+        "✅ OHLCV TEST SUCCESSFUL"
     )
 
 
