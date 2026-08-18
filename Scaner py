@@ -1,0 +1,408 @@
+import requests
+import time
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+DEX_BASE = "https://api.dexscreener.com"
+GT_BASE = "https://api.geckoterminal.com/api/v2"
+
+REQUEST_TIMEOUT = 12
+
+MIN_LIQUIDITY = 75_000
+MIN_VOLUME_5M = 5_000
+MIN_VOLUME_1H = 20_000
+
+MAX_TOKENS = 100
+MAX_PAIRS = 120
+MAX_CANDIDATES_FOR_OHLCV = 20
+
+MIN_DISCOVERY_SCORE = 35
+EARLY_RADAR_SCORE = 50
+
+BUY_NOW_SCORE = 78
+BUY_NOW_MIN_LIQUIDITY = 100_000
+BUY_NOW_MIN_BS5 = 1.50
+BUY_NOW_MIN_BS1H = 1.10
+BUY_NOW_MIN_MA = 2
+BUY_NOW_MIN_VOL_ACCEL = 1.20
+
+session = requests.Session()
+
+session.headers.update({
+    "User-Agent": "Crypto-Pump-Scanner/6.0",
+    "Accept": "application/json",
+})
+
+REJECTION_COUNTER = Counter()
+
+
+# ============================================================
+# SAFE HELPERS
+# ============================================================
+
+def safe_float(value, default=0.0):
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def safe_int(value, default=0):
+    try:
+        if value is None:
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def record_rejection(reason):
+    REJECTION_COUNTER[reason] += 1
+
+
+def get_json(url, params=None):
+    try:
+        response = session.get(
+            url,
+            params=params,
+            timeout=REQUEST_TIMEOUT
+        )
+
+        response.raise_for_status()
+        return response.json()
+
+    except Exception as exc:
+        print(f"API error: {url}")
+        print(exc)
+        return None
+
+
+# ============================================================
+# AGE
+# ============================================================
+
+def calculate_age_hours(timestamp_ms):
+
+    if not timestamp_ms:
+        return None
+
+    try:
+        age_ms = (
+            time.time() * 1000
+            - float(timestamp_ms)
+        )
+
+        if age_ms < 0:
+            return 0
+
+        return age_ms / 3_600_000
+
+    except Exception:
+        return None
+
+
+# ============================================================
+# DISCOVERY
+# ============================================================
+
+def get_discovery_tokens():
+
+    urls = [
+        f"{DEX_BASE}/token-boosts/latest/v1",
+        f"{DEX_BASE}/token-boosts/top/v1",
+        f"{DEX_BASE}/token-profiles/latest/v1",
+    ]
+
+    tokens = {}
+
+    for url in urls:
+
+        data = get_json(url)
+
+        if not isinstance(data, list):
+            continue
+
+        for item in data:
+
+            chain_id = item.get("chainId")
+            token_address = item.get("tokenAddress")
+
+            if not chain_id or not token_address:
+                continue
+
+            key = f"{chain_id}:{token_address}"
+
+            tokens[key] = {
+                "chainId": chain_id,
+                "tokenAddress": token_address
+            }
+
+    return list(tokens.values())[:MAX_TOKENS]
+
+
+# ============================================================
+# TOKEN PAIRS
+# ============================================================
+
+def get_token_pairs(token):
+
+    token_address = token["tokenAddress"]
+
+    url = (
+        f"{DEX_BASE}/latest/dex/tokens/"
+        f"{token_address}"
+    )
+
+    data = get_json(url)
+
+    if not isinstance(data, dict):
+        return []
+
+    pairs = data.get("pairs")
+
+    if not isinstance(pairs, list):
+        return []
+
+    return pairs
+
+
+# ============================================================
+# EXTRACT DATA
+# ============================================================
+
+def extract_pair_data(pair):
+
+    price_change = pair.get("priceChange") or {}
+    volume = pair.get("volume") or {}
+    liquidity_data = pair.get("liquidity") or {}
+    txns = pair.get("txns") or {}
+
+    txns_5m = txns.get("m5") or {}
+    txns_1h = txns.get("h1") or {}
+
+    buys_5m = safe_int(txns_5m.get("buys"))
+    sells_5m = safe_int(txns_5m.get("sells"))
+
+    buys_1h = safe_int(txns_1h.get("buys"))
+    sells_1h = safe_int(txns_1h.get("sells"))
+
+    bs5 = buys_5m / max(sells_5m, 1)
+    bs1h = buys_1h / max(sells_1h, 1)
+
+    base_token = pair.get("baseToken") or {}
+
+    return {
+        "symbol": base_token.get("symbol") or "UNKNOWN",
+
+        "chain": pair.get("chainId") or "unknown",
+
+        "dex_id": pair.get("dexId") or "",
+
+        "url": pair.get("url") or "",
+
+        "price": safe_float(pair.get("priceUsd")),
+
+        "volume_5m": safe_float(volume.get("m5")),
+
+        "volume_1h": safe_float(volume.get("h1")),
+
+        "volume_6h": safe_float(volume.get("h6")),
+
+        "volume_24h": safe_float(volume.get("h24")),
+
+        "liquidity": safe_float(
+            liquidity_data.get("usd")
+        ),
+
+        "buys_5m": buys_5m,
+        "sells_5m": sells_5m,
+
+        "buys_1h": buys_1h,
+        "sells_1h": sells_1h,
+
+        "buy_sell_5m": bs5,
+        "buy_sell_1h": bs1h,
+
+        "change_5m": safe_float(
+            price_change.get("m5")
+        ),
+
+        "change_1h": safe_float(
+            price_change.get("h1")
+        ),
+
+        "change_6h": safe_float(
+            price_change.get("h6")
+        ),
+
+        "change_24h": safe_float(
+            price_change.get("h24")
+        ),
+
+        "age_hours": calculate_age_hours(
+            pair.get("pairCreatedAt")
+        ),
+
+        "pair_address": pair.get("pairAddress"),
+
+        "base_address": base_token.get("address"),
+
+        "fdv": safe_float(pair.get("fdv")),
+
+        "market_cap": safe_float(
+            pair.get("marketCap")
+        ),
+    }
+
+
+# ============================================================
+# PRE-PUMP FILTER
+# ============================================================
+
+def pre_pump_filter(data):
+
+    reasons = []
+
+    liquidity = data["liquidity"]
+    volume_5m = data["volume_5m"]
+    volume_1h = data["volume_1h"]
+
+    bs5 = data["buy_sell_5m"]
+    bs1h = data["buy_sell_1h"]
+
+    change_5m = data["change_5m"]
+    change_1h = data["change_1h"]
+    change_6h = data["change_6h"]
+
+    if liquidity < MIN_LIQUIDITY:
+        reasons.append(
+            f"Liquidity ${liquidity:,.0f} < "
+            f"${MIN_LIQUIDITY:,.0f}"
+        )
+
+    if volume_5m < MIN_VOLUME_5M:
+        reasons.append(
+            f"5M volume ${volume_5m:,.0f} too low"
+        )
+
+    if volume_1h < MIN_VOLUME_1H:
+        reasons.append(
+            f"1H volume ${volume_1h:,.0f} too low"
+        )
+
+    if change_1h <= -20:
+        reasons.append(
+            "1H heavy negative momentum"
+        )
+
+    if change_5m >= 60:
+        reasons.append(
+            "5M already pumped >60%"
+        )
+
+    if change_1h >= 100:
+        reasons.append(
+            "1H already pumped >100%"
+        )
+
+    if change_6h >= 500:
+        reasons.append(
+            "6H already heavily extended"
+        )
+
+    if bs5 < 1.10:
+        reasons.append(
+            f"Weak 5M buyers ({bs5:.2f})"
+        )
+
+    if bs1h < 0.80:
+        reasons.append(
+            f"Weak 1H buyer/seller ratio "
+            f"({bs1h:.2f})"
+        )
+
+    return len(reasons) == 0, reasons
+
+
+# ============================================================
+# BASE SCORE
+# ============================================================
+
+def score_candidate(data):
+
+    score = 0
+    reasons = []
+
+    liquidity = data["liquidity"]
+    volume_5m = data["volume_5m"]
+    volume_1h = data["volume_1h"]
+
+    bs5 = data["buy_sell_5m"]
+    bs1h = data["buy_sell_1h"]
+
+    change_5m = data["change_5m"]
+    change_1h = data["change_1h"]
+    change_6h = data["change_6h"]
+
+    # --------------------------------------------------------
+    # LIQUIDITY
+    # --------------------------------------------------------
+
+    if liquidity >= 500_000:
+        score += 15
+        reasons.append("Very strong liquidity")
+
+    elif liquidity >= 250_000:
+        score += 13
+        reasons.append("Strong liquidity")
+
+    elif liquidity >= 150_000:
+        score += 10
+        reasons.append("Good liquidity")
+
+    elif liquidity >= 75_000:
+        score += 6
+        reasons.append("Acceptable liquidity")
+
+    # --------------------------------------------------------
+    # 1H VOLUME
+    # --------------------------------------------------------
+
+    if volume_1h >= 1_000_000:
+        score += 12
+        reasons.append("Very strong 1H volume")
+
+    elif volume_1h >= 500_000:
+        score += 10
+        reasons.append("Strong 1H volume")
+
+    elif volume_1h >= 200_000:
+        score += 8
+        reasons.append("Good 1H volume")
+
+    else:
+        score += 4
+
+    # --------------------------------------------------------
+    # 5M VOLUME
+    # --------------------------------------------------------
+
+    if volume_5m >= 100_000:
+        score += 12
+        reasons.append("Strong 5M volume")
+
+    elif volume_5m >= 50_000:
+        score += 10
+        reasons.append("Increasing 5M activity")
+
+    elif volume_5m >= 20_000:
+        score += 7
+        reasons.append("Good 5M activity")
+
+   
